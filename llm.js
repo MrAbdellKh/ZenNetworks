@@ -1,41 +1,96 @@
-import fetch from 'node-fetch';
-import readline from 'readline';
+import express from 'express';
+import sqlite3 from 'sqlite3';
+import { open } from 'sqlite';
+import path from 'path';
 
-export async function generateSQLFromText(userPrompt, dbSchema) {
-  const prompt = `${dbSchema}
-Question utilisateur : """${userPrompt}"""
+const app = express();
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
-Réponds uniquement avec la requête SQL valide.
-Pas de texte, pas d'intro, pas de guillemets, pas de commentaire.`;
+const dbPath = path.resolve('./ma_base.db');
+let db;
 
-  const response = await fetch("http://localhost:11434/api/generate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "sqlcoder",
-      prompt: prompt,
-      stream: true
-    })
-  });
+// 🔁 Schéma SQL global (à réutiliser dans d'autres endpoints si besoin)
+const dbSchema = `
+Tu es un générateur SQL. Voici les tables disponibles :
+- users(id, name, email, created_at)
+- orders(id, user_id, product, price, created_at)
 
-  const rl = readline.createInterface({
-    input: response.body,
-    crlfDelay: Infinity,
-  });
+Ta mission : Génère uniquement une requête SQL correcte.
+- Pas d'explication.
+- Pas de blabla.
+- Pas de guillemets autour du résultat.
+- Pas de commentaires.
 
-  let fullText = "";
+Le résultat attendu est une requête SQL pure, exécutable, comme :
+SELECT * FROM users;
+`;
 
-  for await (const line of rl) {
-    if (!line.trim()) continue;
-    try {
-      const parsed = JSON.parse(line);
-      if (parsed.response) {
-        fullText += parsed.response;
-      }
-    } catch (err) {
-      console.error("Erreur JSON stream :", err.message);
-    }
+// Fonction factice à placer dans ce fichier si tu n'as pas encore de llm.js séparé
+export async function generateSQLFromText(question, schema) {
+  // Exemple simple, à remplacer par ton vrai générateur
+  if (/user/i.test(question)) return 'SELECT * FROM users;';
+  if (/order/i.test(question)) return 'SELECT * FROM orders;';
+  return '';
+}
+
+// Connexion à la base SQLite
+(async () => {
+  try {
+    db = await open({ filename: dbPath, driver: sqlite3.Database });
+    app.listen(5000, () => {
+      console.log('🚀 Serveur en écoute sur http://localhost:5000');
+    });
+  } catch (err) {
+    console.error("❌ Erreur de connexion à la base :", err.message);
+  }
+})();
+
+// Endpoint Slack
+app.post('/slack', async (req, res) => {
+  const question = req.body?.text;
+
+  if (!question) {
+    return res.status(400).json({
+      status: 'error',
+      message: 'La requête Slack ne contient pas de texte.'
+    });
   }
 
-  return fullText.replace(/["`]+/g, '').trim();
-}
+  try {
+    const sql = await generateSQLFromText(question, dbSchema);
+
+    // Protection si la requête SQL générée est vide
+    if (!sql || typeof sql !== 'string' || !sql.trim()) {
+      return res.status(500).json({
+        status: 'error',
+        message: 'La génération de la requête SQL a échoué.',
+        sql
+      });
+    }
+
+    console.log('\n------------------------------------');
+    console.log('📩 Question Slack :', question);
+    console.log('📤 Requête SQL générée :', sql);
+    console.log('------------------------------------');
+
+    // 💥 Protection simple : rejet des requêtes dangereuses (DROP, DELETE, etc.)
+    if (/drop|delete|update/i.test(sql)) {
+      return res.status(403).json({
+        status: 'error',
+        message: 'Requête SQL interdite détectée (DROP, DELETE, etc.)'
+      });
+    }
+
+    const result = await db.all(sql);
+    res.json({ status: 'ok', sql, result });
+
+  } catch (err) {
+    console.error("❌ Erreur de traitement :", err.message);
+    res.status(500).json({
+      status: 'error',
+      message: 'Erreur lors du traitement de la requête',
+      error: err.message
+    });
+  }
+});

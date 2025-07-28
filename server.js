@@ -1,5 +1,4 @@
 import express from 'express';
-import { generateSQLFromText } from './Llm.js';
 import sqlite3 from 'sqlite3';
 import { open } from 'sqlite';
 import path from 'path';
@@ -26,6 +25,13 @@ Ta mission : Génère uniquement une requête SQL correcte.
 Le résultat attendu est une requête SQL pure, exécutable, comme :
 SELECT * FROM users;
 `;
+
+// Fonction factice pour générer une requête SQL à partir d'une question
+function generateSQLFromText(question, schema) {
+  if (/user/i.test(question)) return 'SELECT * FROM users;';
+  if (/order/i.test(question)) return 'SELECT * FROM orders;';
+  return '';
+}
 
 // Connexion à la base SQLite
 (async () => {
