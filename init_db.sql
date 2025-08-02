@@ -28,3 +28,4 @@ INSERT INTO orders (user_id, product, price, created_at) VALUES
 (2, 'Stylo', 2.49, '2025-07-11'),
 (3, 'Clavier', 45.00, '2025-07-15'),
 (1, 'Cahier', 3.75, '2025-07-05');
+

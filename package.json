@@ -11,12 +11,12 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "axios": "^1.11.0",
     "express": "^5.1.0",
+    "langchain": "^0.0.140",
+    "mysql2": "^3.9.7",
     "node-fetch": "^3.3.2",
     "sqlite": "^5.1.1",
-    "sqlite3": "^5.1.7",
-    "langchain": "^0.0.140",
-    "axios": "^1.6.7",
-    "mysql2": "^3.9.7"
+    "sqlite3": "^5.1.7"
   }
 }

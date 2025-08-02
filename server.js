@@ -2,38 +2,26 @@ import express from 'express';
 import sqlite3 from 'sqlite3';
 import { open } from 'sqlite';
 import path from 'path';
+import axios from 'axios';
+import { generateSQLFromText } from './llm.js';
+import { isSafeSQL, sanitizeSQL } from './utils/sanitize.js';
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
+// Chemin vers ta base SQLite
 const dbPath = path.resolve('./ma_base.db');
 let db;
 
-// 🔁 Schéma SQL global (à réutiliser dans d'autres endpoints si besoin)
+// Schéma injecté dans les prompts pour que le LLM sache quelles tables existent
 const dbSchema = `
-Tu es un générateur SQL. Voici les tables disponibles :
+Tables :
 - users(id, name, email, created_at)
 - orders(id, user_id, product, price, created_at)
-
-Ta mission : Génère uniquement une requête SQL correcte.
-- Pas d'explication.
-- Pas de blabla.
-- Pas de guillemets autour du résultat.
-- Pas de commentaires.
-
-Le résultat attendu est une requête SQL pure, exécutable, comme :
-SELECT * FROM users;
 `;
 
-// Fonction factice pour générer une requête SQL à partir d'une question
-function generateSQLFromText(question, schema) {
-  if (/user/i.test(question)) return 'SELECT * FROM users;';
-  if (/order/i.test(question)) return 'SELECT * FROM orders;';
-  return '';
-}
-
-// Connexion à la base SQLite
+// Connexion à la base et démarrage HTTP
 (async () => {
   try {
     db = await open({ filename: dbPath, driver: sqlite3.Database });
@@ -41,46 +29,94 @@ function generateSQLFromText(question, schema) {
       console.log('🚀 Serveur en écoute sur http://localhost:5000');
     });
   } catch (err) {
-    console.error("❌ Erreur de connexion à la base :", err.message);
+    console.error('❌ Erreur de connexion à la base :', err.message);
+    process.exit(1);
   }
 })();
 
-// Endpoint Slack
+/**
+ * Point d'entrée Slack (slash command) - version sans analyse.
+ * Flux :
+ * 1. Ack immédiat (réponse 200) pour éviter timeout Slack.
+ * 2. Génération SQL et exécution sur la base.
+ * 3. Résultat brut envoyé sur Slack.
+ */
 app.post('/slack', async (req, res) => {
   const question = req.body?.text;
+  const responseUrl = req.body?.response_url;
 
-  if (!question) {
+  if (!question || !responseUrl) {
     return res.status(400).json({
       status: 'error',
-      message: 'La requête Slack ne contient pas de texte.'
+      message: 'Payload invalide : il faut `text` et `response_url`.'
     });
   }
 
+  // 1. Ack immédiat (Slack attend réponse <3s)
+  res.status(200).json({
+    text: '✅ Reçu. Génération de la requête SQL...'
+  });
+
   try {
-    const sql = await generateSQLFromText(question, dbSchema);
+    // 2. Générer la requête SQL via LLM
+    const rawSQL = await generateSQLFromText(question, dbSchema);
+    //console.log('🔍 Raw SQL from LLM:', rawSQL);
 
-    console.log('\n------------------------------------');
-    console.log('📩 Question Slack :', question);
-    console.log('📤 Requête SQL générée :', sql);
-    console.log('------------------------------------');
+    // Nettoyer la requête
+    const sql = sanitizeSQL(rawSQL);
+    console.log('----------------✅ Cleaned SQL to execute:', sql);
 
-    // 💥 Protection simple : rejet des requêtes dangereuses (DROP, DELETE, etc.)
-    if (/drop|delete|update/i.test(sql)) {
-      return res.status(403).json({
-        status: 'error',
-        message: 'Requête SQL interdite détectée (DROP, DELETE, etc.)'
+    if (!sql) {
+      await axios.post(responseUrl, {
+        text: `❌ Échec : la requête SQL générée est vide ou invalide après nettoyage.\nRequête brute : \`${rawSQL}\``
       });
+      return;
     }
 
-    const result = await db.all(sql);
-    res.json({ status: 'ok', sql, result });
+    if (!isSafeSQL(sql)) {
+      await axios.post(responseUrl, {
+        text: `❌ Requête interdite détectée (DROP/DELETE/UPDATE/etc.) : \`${sql}\``
+      });
+      return;
+    }
+
+    // 3. Exécuter la requête SQL
+    let result;
+    try {
+      result = await db.all(sql);
+    } catch (dbErr) {
+      console.error('Erreur exécution SQL :', dbErr.message);
+      await axios.post(responseUrl, {
+        text: `❌ Erreur lors de l'exécution de la requête SQL : \`${dbErr.message}\`\nRequête : \`${sql}\``
+      });
+      return;
+    }
+
+    // 4. Envoyer seulement le résultat brut
+    await axios.post(responseUrl, {
+      text: `Résultat pour : *${question}*`,
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*Requête SQL exécutée :*\n\`\`\`\n${sql}\n\`\`\``
+          }
+        },
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*Résultat brut :*\n\`\`\`${JSON.stringify(result, null, 2)}\`\`\``
+          }
+        }
+      ]
+    });
 
   } catch (err) {
-    console.error("❌ Erreur de traitement :", err.message);
-    res.status(500).json({
-      status: 'error',
-      message: 'Erreur lors du traitement de la requête',
-      error: err.message
+    console.error('Erreur pipeline Slack :', err);
+    await axios.post(responseUrl, {
+      text: `❌ Erreur interne pendant le traitement : ${err.message}`
     });
   }
 });

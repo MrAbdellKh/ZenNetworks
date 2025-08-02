@@ -1,2 +1,5 @@
 # ZenNetworks
-Projet de Stage Summer Cump ( 4émme année IIR Emsi )
+<!-- telechargé llama -->
+git clone https://github.com/ggerganov/llama.cpp
+cd llama.cpp
+make

@@ -1,96 +1,94 @@
-import express from 'express';
-import sqlite3 from 'sqlite3';
-import { open } from 'sqlite';
-import path from 'path';
+// On importe "spawn" pour lancer un processus externe (ici : Ollama CLI)
+// et "sanitizeSQL" pour nettoyer/la sécuriser la requête SQL renvoyée par le LLM.
+import { spawn } from 'child_process';
+import { sanitizeSQL } from './utils/sanitize.js';
 
-const app = express();
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+/**
+ * Lance Ollama en CLI avec un modèle et un prompt, et retourne sa sortie texte.
+ * @param {string} model - nom du modèle (ex : "gemma3")
+ * @param {string} prompt - instruction qu’on envoie au LLM
+ * @returns {Promise<string>} - sortie brute du LLM (texte)
+ */
+function runOllama(model, prompt) {
+  // On crée et retourne une promesse parce que l'appel est asynchrone.
+  return new Promise((resolve, reject) => {
+    // Construction de l'argument de ligne de commande : ollama run <model> <prompt>
+    const args = ['run', model, prompt];
 
-const dbPath = path.resolve('./ma_base.db');
-let db;
+    // On lance le binaire "ollama" avec les arguments.
+    // stdio : on ignore stdin, on capture stdout et stderr.
+    const proc = spawn('ollama', args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-// 🔁 Schéma SQL global (à réutiliser dans d'autres endpoints si besoin)
-const dbSchema = `
-Tu es un générateur SQL. Voici les tables disponibles :
-- users(id, name, email, created_at)
-- orders(id, user_id, product, price, created_at)
+    // Variables pour accumuler les sorties au fur et à mesure qu'elles arrivent.
+    let stdout = '';
+    let stderr = '';
 
-Ta mission : Génère uniquement une requête SQL correcte.
-- Pas d'explication.
-- Pas de blabla.
-- Pas de guillemets autour du résultat.
-- Pas de commentaires.
+    // Quand Ollama écrit sur sa sortie standard, on l'ajoute à stdout.
+    proc.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
 
-Le résultat attendu est une requête SQL pure, exécutable, comme :
-SELECT * FROM users;
-`;
+    // Quand Ollama écrit une erreur ou un avertissement, on l'ajoute à stderr.
+    proc.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
 
-// Fonction factice à placer dans ce fichier si tu n'as pas encore de llm.js séparé
-export async function generateSQLFromText(question, schema) {
-  // Exemple simple, à remplacer par ton vrai générateur
-  if (/user/i.test(question)) return 'SELECT * FROM users;';
-  if (/order/i.test(question)) return 'SELECT * FROM orders;';
-  return '';
+    // Quand le processus se termine...
+    proc.on('close', (code) => {
+      // Si le code de sortie est différent de zéro, c'est une erreur : on rejette.
+      if (code !== 0) {
+        return reject(new Error(`Ollama exited ${code} stderr=${stderr.trim()}`));
+      }
+      // Sinon on résout avec la sortie nettoyée (trim pour supprimer espaces en trop).
+      resolve(stdout.trim());
+    });
+
+    // Si lancer le process échoue (ex : binaire introuvable), on rejette aussi.
+    proc.on('error', (err) => {
+      reject(err);
+    });
+  });
 }
 
-// Connexion à la base SQLite
-(async () => {
+/**
+ * Génère une requête SQL à partir d'une question en langage naturel et d'un schéma.
+ * @param {string} question - ce que l'utilisateur veut savoir ("Quel est le CA ?")
+ * @param {string} schema - description du schéma de la base (tables, colonnes)
+ * @returns {Promise<string>} - requête SQL propre (une ligne) ou chaîne vide si échec
+ */
+export async function generateSQLFromText(question, schema) {
+  // On construit le prompt envoyé au LLM. On lui donne :
+  // - le schéma,
+  // - la question,
+  // - des règles strictes pour n'avoir que la requête SQL.
+  const promptSQL = `
+Tu es un générateur SQL. Voici le schéma :
+${schema}
+
+Question : "${question}"
+
+Règles :
+- Répond uniquement avec une requête SQL valide.
+- Pas de commentaires, pas d'explications, pas de guillemets autour.
+- Pas d'opérations destructrices (DROP, DELETE, UPDATE, ALTER, TRUNCATE).
+Donne la requête.
+`.trim(); // trim() enlève les sauts de ligne inutiles au début/fin.
+
   try {
-    db = await open({ filename: dbPath, driver: sqlite3.Database });
-    app.listen(5000, () => {
-      console.log('🚀 Serveur en écoute sur http://localhost:5000');
-    });
+    // On appelle Ollama avec le modèle et le prompt, on attend sa réponse.
+    const rawOutput = await runOllama('gemma3', promptSQL);
+
+    // On nettoie la sortie brute : suppression de choses bizarres, sécurisation minimale.
+    const cleaned = sanitizeSQL(rawOutput);
+
+    // On découpe en lignes, on tronque chaque ligne, et on prend la première non vide.
+    // C'est supposé être la requête SQL.
+    const line = cleaned
+      .split('\n')          // sépare par ligne
+      .map(l => l.trim())   // enlève espaces au début/fin de chaque ligne
+      .find(l => l.length > 0); // prend la première ligne qui n'est pas vide
+
+    // Retourne la requête trouvée, ou chaîne vide si rien.
+    return line || '';
   } catch (err) {
-    console.error("❌ Erreur de connexion à la base :", err.message);
+    // Si quelque chose a planté (Ollama indisponible, timeout, etc.), on logue et on retourne vide.
+    console.error("Erreur génération SQL par LLM :", err.message);
+    return '';
   }
-})();
-
-// Endpoint Slack
-app.post('/slack', async (req, res) => {
-  const question = req.body?.text;
-
-  if (!question) {
-    return res.status(400).json({
-      status: 'error',
-      message: 'La requête Slack ne contient pas de texte.'
-    });
-  }
-
-  try {
-    const sql = await generateSQLFromText(question, dbSchema);
-
-    // Protection si la requête SQL générée est vide
-    if (!sql || typeof sql !== 'string' || !sql.trim()) {
-      return res.status(500).json({
-        status: 'error',
-        message: 'La génération de la requête SQL a échoué.',
-        sql
-      });
-    }
-
-    console.log('\n------------------------------------');
-    console.log('📩 Question Slack :', question);
-    console.log('📤 Requête SQL générée :', sql);
-    console.log('------------------------------------');
-
-    // 💥 Protection simple : rejet des requêtes dangereuses (DROP, DELETE, etc.)
-    if (/drop|delete|update/i.test(sql)) {
-      return res.status(403).json({
-        status: 'error',
-        message: 'Requête SQL interdite détectée (DROP, DELETE, etc.)'
-      });
-    }
-
-    const result = await db.all(sql);
-    res.json({ status: 'ok', sql, result });
-
-  } catch (err) {
-    console.error("❌ Erreur de traitement :", err.message);
-    res.status(500).json({
-      status: 'error',
-      message: 'Erreur lors du traitement de la requête',
-      error: err.message
-    });
-  }
-});
+}
